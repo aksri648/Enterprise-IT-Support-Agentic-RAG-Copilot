@@ -10,35 +10,104 @@ from app.rag.vectorstore import get_retriever
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-_llm = None
+_active_model: str | None = None
+_active_llm: ChatOpenAI | None = None
 _web_search = None
 
-def llm():
-    global _llm
-    if _llm is None:
-        api_key = (settings.openai_api_key or settings.groq_api_key).strip()
-        if not api_key:
-            raise RuntimeError("API key is missing: please set OPENAI_API_KEY or GROQ_API_KEY")
+def is_model_not_found_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(k in msg for k in [
+        "404", "model_not_found", "does not exist", "not have access", "decommissioned", "deprecated"
+    ])
 
-        base_url = (settings.openai_base_url or "").strip()
-        # Auto-configure Groq endpoint if a Groq key or Groq model is used without custom base_url
-        if not base_url and (api_key.startswith("gsk_") or settings.groq_api_key):
-            base_url = "https://api.groq.com/openai/v1"
+def get_candidate_models() -> list[str]:
+    api_key = (settings.openai_api_key or settings.groq_api_key).strip()
+    base_url = (settings.openai_base_url or "").strip()
+    is_groq = bool(settings.groq_api_key) or api_key.startswith("gsk_") or "groq.com" in base_url
 
-        model = settings.openai_model
-        if "groq.com" in base_url and ("gpt-" in model.lower() or not model):
-            model = settings.groq_model or "llama-3.3-70b-versatile"
+    candidates = []
+    if is_groq:
+        # Check user-configured model first (avoiding decommissioned llama-3.3-70b-versatile)
+        configured = settings.groq_model or settings.openai_model
+        if configured and configured != "llama-3.3-70b-versatile":
+            candidates.append(configured)
+        # Supported production models on Groq
+        for m in ["openai/gpt-oss-120b", "llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
+            if m not in candidates:
+                candidates.append(m)
+        # Fallback to llama-3.3-70b-versatile only as last option (for enterprise/whitelisted keys)
+        if "llama-3.3-70b-versatile" not in candidates:
+            candidates.append("llama-3.3-70b-versatile")
+    else:
+        # OpenAI or OpenAI-compatible endpoint
+        configured = settings.openai_model
+        # If user inadvertently left a llama model when using OpenAI endpoint, discard it
+        if configured and not configured.lower().startswith("llama-"):
+            candidates.append(configured)
+        for m in ["gpt-4o-mini", "gpt-4o"]:
+            if m not in candidates:
+                candidates.append(m)
+    return candidates
 
-        kwargs = {
-            "model": model,
-            "temperature": 0,
-            "api_key": api_key,
-        }
-        if base_url:
-            kwargs["base_url"] = base_url
+def _create_llm_instance(model_name: str) -> ChatOpenAI:
+    api_key = (settings.openai_api_key or settings.groq_api_key).strip()
+    if not api_key:
+        raise RuntimeError("API key is missing: please set OPENAI_API_KEY or GROQ_API_KEY")
 
-        _llm = ChatOpenAI(**kwargs)
-    return _llm
+    base_url = (settings.openai_base_url or "").strip()
+    is_groq = bool(settings.groq_api_key) or api_key.startswith("gsk_") or "groq.com" in base_url
+    if not base_url and is_groq:
+        base_url = "https://api.groq.com/openai/v1"
+
+    kwargs = {
+        "model": model_name,
+        "temperature": 0,
+        "api_key": api_key,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    return ChatOpenAI(**kwargs)
+
+def llm() -> ChatOpenAI:
+    global _active_llm, _active_model
+    if _active_llm is None:
+        candidates = get_candidate_models()
+        _active_model = candidates[0]
+        _active_llm = _create_llm_instance(_active_model)
+    return _active_llm
+
+def call_llm_with_fallback(invoke_fn):
+    global _active_llm, _active_model
+    candidates = get_candidate_models()
+
+    start_idx = 0
+    if _active_model in candidates:
+        start_idx = candidates.index(_active_model)
+
+    last_exc = None
+    for idx in range(start_idx, len(candidates)):
+        model_name = candidates[idx]
+        try:
+            if _active_llm is None or _active_model != model_name:
+                _active_model = model_name
+                _active_llm = _create_llm_instance(model_name)
+            return invoke_fn(_active_llm)
+        except Exception as exc:
+            if is_model_not_found_error(exc) and idx + 1 < len(candidates):
+                next_model = candidates[idx + 1]
+                logger.warning(
+                    f"Model '{model_name}' failed with model-not-found error ({exc}). "
+                    f"Automatically switching to '{next_model}'..."
+                )
+                last_exc = exc
+                _active_model = None
+                _active_llm = None
+                continue
+            raise exc
+
+    if last_exc:
+        raise last_exc
 
 def web_search_tool():
     global _web_search
@@ -60,8 +129,9 @@ def add_trace(state: AgentState, message: str):
 def route_question(state: AgentState):
     route = "kb"
     try:
-        router = llm().with_structured_output(RouteDecision, method="json_mode")
-        decision = router.invoke(f"""
+        def _invoke(model_inst):
+            router = model_inst.with_structured_output(RouteDecision, method="json_mode")
+            return router.invoke(f"""
 You route messages for an enterprise IT support assistant.
 Use kb for questions about company IT policies, VPN, password reset, MFA, laptop setup,
 software access, security, email, devices, troubleshooting, or technology support.
@@ -69,6 +139,7 @@ Use direct only for greetings, thanks, or casual chat that needs no company know
 Question: {state['question']}
 Return valid JSON like {{"route":"kb"}}.
 """)
+        decision = call_llm_with_fallback(_invoke)
         if hasattr(decision, "route"):
             route = decision.route
         elif isinstance(decision, dict) and "route" in decision:
@@ -88,15 +159,17 @@ def retrieve_kb(state: AgentState):
 def grade_kb(state: AgentState):
     grade_val = "weak"
     try:
-        grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
         context = "\n\n".join(f"Source: {d.metadata.get('source','unknown')}\n{d.page_content}" for d in state["kb_docs"])
-        decision = grader.invoke(f"""
+        def _invoke(model_inst):
+            grader = model_inst.with_structured_output(EvidenceGrade, method="json_mode")
+            return grader.invoke(f"""
 You grade evidence for an enterprise IT support assistant.
 Question: {state['question']}
 Private company KB evidence:\n{context}
 Return good only if the evidence is sufficient to answer confidently and specifically.
 Otherwise return weak. JSON: {{"grade":"good"}} or {{"grade":"weak"}}.
 """)
+        decision = call_llm_with_fallback(_invoke)
         if hasattr(decision, "grade"):
             grade_val = decision.grade
         elif isinstance(decision, dict) and "grade" in decision:
@@ -131,13 +204,15 @@ def search_web(state: AgentState):
 def grade_web(state: AgentState):
     grade_val = "weak"
     try:
-        grader = llm().with_structured_output(EvidenceGrade, method="json_mode")
-        decision = grader.invoke(f"""
+        def _invoke(model_inst):
+            grader = model_inst.with_structured_output(EvidenceGrade, method="json_mode")
+            return grader.invoke(f"""
 Question: {state['question']}
 Web evidence:\n{state['web_results']}
 Return good if the evidence is sufficient and directly relevant; otherwise weak.
 Return valid JSON like {{"grade":"good"}}.
 """)
+        decision = call_llm_with_fallback(_invoke)
         if hasattr(decision, "grade"):
             grade_val = decision.grade
         elif isinstance(decision, dict) and "grade" in decision:
@@ -155,11 +230,12 @@ def after_web(state: AgentState) -> Literal["generate_from_web", "rewrite_query"
     return "insufficient"
 
 def rewrite_query(state: AgentState):
-    rewritten = llm().invoke(f"""
+    prompt = f"""
 Rewrite this IT support question for better private knowledge retrieval and vendor web search.
 Preserve intent, add useful technical keywords, do not answer, return only the query.
 Question: {state['question']}
-""").content.strip()
+"""
+    rewritten = call_llm_with_fallback(lambda m: m.invoke(prompt)).content.strip()
     return {
         "current_query": rewritten,
         "retry_count": state["retry_count"] + 1,
@@ -168,12 +244,13 @@ Question: {state['question']}
 
 def generate_from_kb(state: AgentState):
     context = "\n\n".join(f"[Source: {d.metadata.get('source','unknown')}]\n{d.page_content}" for d in state["kb_docs"])
-    answer = llm().invoke(f"""
+    prompt = f"""
 You are an enterprise IT support copilot. Answer ONLY from the private company KB below.
 Be concise, actionable, and safe. If steps are present, present them clearly.
 Do not invent policy details. Mention that the answer is based on the company's private knowledge base.
 Question: {state['question']}\n\nPrivate KB:\n{context}
-""").content
+"""
+    answer = call_llm_with_fallback(lambda m: m.invoke(prompt)).content
     citations = []
     seen = set()
     for d in state["kb_docs"]:
@@ -184,15 +261,17 @@ Question: {state['question']}\n\nPrivate KB:\n{context}
     return {"answer": answer, "source_used": "private_kb", "citations": citations, "trace": add_trace(state, "Answer generation → PRIVATE KB")}
 
 def generate_from_web(state: AgentState):
-    answer = llm().invoke(f"""
+    prompt = f"""
 You are an enterprise IT support copilot. The private company KB was insufficient.
 Answer ONLY from the web evidence below. Clearly say this is external web information and may need IT validation before changing company-managed systems.
 Question: {state['question']}\n\nWeb evidence:\n{state['web_results']}
-""").content
+"""
+    answer = call_llm_with_fallback(lambda m: m.invoke(prompt)).content
     return {"answer": answer, "source_used": "web_search", "trace": add_trace(state, "Answer generation → WEB SEARCH")}
 
 def direct_answer(state: AgentState):
-    answer = llm().invoke(f"Respond briefly and naturally to: {state['question']}").content
+    prompt = f"Respond briefly and naturally to: {state['question']}"
+    answer = call_llm_with_fallback(lambda m: m.invoke(prompt)).content
     return {"answer": answer, "source_used": "direct", "trace": add_trace(state, "Direct response → no retrieval")}
 
 def insufficient(state: AgentState):

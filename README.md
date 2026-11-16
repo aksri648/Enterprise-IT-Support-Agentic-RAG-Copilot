@@ -281,8 +281,8 @@ Create a `.env` file in the project root directory (or copy from `.env.example`)
 ```env
 # Groq LLM configuration via OpenAI-compatible endpoint
 OPENAI_BASE_URL=https://api.groq.com/openai/v1
-OPENAI_API_KEY=gsk_your_groq_api_key_here
-OPENAI_MODEL=llama-3.3-70b-versatile
+GROQ_API_KEY=gsk_your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-120b
 
 # External Search
 TAVILY_API_KEY=your_tavily_api_key_here
@@ -309,7 +309,8 @@ APP_ENV=development
 |---|---|---|---|
 | `OPENAI_BASE_URL` | Base URL for OpenAI-compatible LLM endpoint | `https://api.groq.com/openai/v1` | ⚠️ Optional (defaults to OpenAI) |
 | `OPENAI_API_KEY` | API key for LLM provider (Groq `gsk_...` or OpenAI `sk-...`) | `gsk_...` | ✅ Yes |
-| `OPENAI_MODEL` | LLM model identifier | `llama-3.3-70b-versatile` | ⚠️ Optional |
+| `OPENAI_MODEL` | LLM model identifier | `gpt-4o-mini` | ⚠️ Optional |
+| `GROQ_MODEL` | Groq LLM model identifier | `openai/gpt-oss-120b` | ⚠️ Optional |
 | `TAVILY_API_KEY` | API key for Tavily web search | `tvly-...` | ✅ Yes |
 | `PINECONE_API_KEY` | API key for Pinecone vector database | `pckey-...` | ✅ Yes |
 | `PINECONE_INDEX_NAME` | Pinecone index name | `fde-it-support-rag` | ⚠️ Optional (default: `fde-it-support-rag`) |
